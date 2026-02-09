@@ -1,19 +1,207 @@
-<!doctype html>
-<html>
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width" />
-		<title>My static Space</title>
-		<link rel="stylesheet" href="style.css" />
-	</head>
-	<body>
-		<div class="card">
-			<h1>Welcome to your static Space!</h1>
-			<p>You can modify this app directly by editing <i>index.html</i> in the Files and versions tab.</p>
-			<p>
-				Also don't forget to check the
-				<a href="https://huggingface.co/docs/hub/spaces" target="_blank">Spaces documentation</a>.
-			</p>
-		</div>
-	</body>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RF-DETR WebGPU</title>
+	<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+    <h1>RF-DETR WebGPU</h1>
+    <div class="subtitle">
+        Real-Time Detection Transformers<br>
+        running 100% locally in your browser.
+    </div>
+
+    <div class="container">
+        <div id="status">
+            <div class="spinner"></div>
+            <div id="status-content">
+                <div id="status-text">Initializing...</div>
+                <div id="status-sub">Please allow camera access</div>
+            </div>
+        </div>
+        <div id="fps">FPS: 0.0</div>
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <div class="controls">
+        <label class="control-label">
+            <span>Threshold</span>
+            <input type="range" id="threshold" min="0" max="1" step="0.01" value="0.5">
+            <span id="thresh-val">0.50</span>
+        </label>
+    </div>
+
+    <footer>
+        Powered by <a href="https://github.com/huggingface/transformers.js" target="_blank">Transformers.js v4</a>
+    </footer>
+
+    <script type="module">
+        import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@next';
+
+        const video = document.getElementById('webcam');
+        const overlay = document.getElementById('overlay');
+        const status = document.getElementById('status');
+        const statusText = document.getElementById('status-text');
+        const statusSub = document.getElementById('status-sub');
+        const fpsElem = document.getElementById('fps');
+        const slider = document.getElementById('threshold');
+        const sliderVal = document.getElementById('thresh-val');
+
+        let detector;
+        let lastTime = performance.now();
+        let threshold = 0.5;
+        
+        const inputCanvas = document.createElement('canvas');
+        const inputCtx = inputCanvas.getContext('2d', { willReadFrequently: true });
+        
+        const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
+
+        slider.addEventListener('input', (e) => {
+            threshold = parseFloat(e.target.value);
+            sliderVal.textContent = threshold.toFixed(2);
+        });
+        
+        // Handle high DPI displays
+        function resizeOverlay() {
+            const width = video.clientWidth;
+            const height = video.clientHeight;
+            const dpr = window.devicePixelRatio || 1;
+            
+            overlay.width = width * dpr;
+            overlay.height = height * dpr;
+            
+            const ctx = overlay.getContext('2d');
+            ctx.scale(dpr, dpr);
+            
+            inputCanvas.width = video.videoWidth;
+            inputCanvas.height = video.videoHeight;
+        }
+
+        window.addEventListener('resize', resizeOverlay);
+
+        // 1. Start Camera
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    facingMode: 'environment',
+                    width: { ideal: 640 },
+                    height: { ideal: 480 }
+                },
+                audio: false
+            });
+            
+            video.srcObject = stream;
+            await new Promise(r => video.onloadedmetadata = r);
+            video.play();
+            resizeOverlay();
+
+        } catch (e) {
+            statusText.textContent = "Camera Error";
+            statusSub.textContent = e.message;
+            document.querySelector('.spinner').style.display = 'none';
+            throw e;
+        }
+
+        // 2. Load Model
+        statusText.textContent = "Loading Model...";
+        statusSub.textContent = "Downloading RF-DETR Nano (fp32)";
+        
+        try {
+            detector = await pipeline('object-detection', 'onnx-community/rfdetr_nano-ONNX', {
+                device: 'webgpu',
+                dtype: 'fp32',
+            });
+            
+            // 3. Warmup
+            statusText.textContent = "Compiling Shaders...";
+            statusSub.textContent = "This may take a moment";
+            
+            inputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
+            await detector(inputCanvas, { threshold: 0.5, percentage: true });
+
+            status.style.opacity = '0';
+            setTimeout(() => status.style.display = 'none', 300);
+
+        } catch (e) {
+            statusText.textContent = "Model Error";
+            statusSub.textContent = e.message;
+            document.querySelector('.spinner').style.display = 'none';
+            throw e;
+        }
+
+        // 4. Render Loop
+        async function loop() {
+            const now = performance.now();
+            const dt = now - lastTime;
+            lastTime = now;
+            
+            if (dt > 0) {
+                fpsElem.textContent = `FPS: ${(1000 / dt).toFixed(1)}`;
+            }
+
+            inputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
+
+            const results = await detector(inputCanvas, {
+                threshold: threshold,
+                percentage: true
+            });
+            drawResults(results);
+
+            requestAnimationFrame(loop);
+        }
+
+        function drawResults(results) {
+            const ctx = overlay.getContext('2d');
+            const w = video.clientWidth;
+            const h = video.clientHeight;
+            
+            // Clear canvas
+            ctx.save();
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.clearRect(0, 0, overlay.width, overlay.height);
+            ctx.restore();
+
+            // Set styles common to all results
+            ctx.font = '600 13px system-ui';
+            ctx.lineWidth = 2.5;
+
+            results.forEach((res, i) => {
+                const { box, label, score } = res;
+                const color = COLORS[i % COLORS.length];
+
+                const x1 = box.xmin * w;
+                const y1 = box.ymin * h;
+                const width = (box.xmax - box.xmin) * w;
+                const height = (box.ymax - box.ymin) * h;
+
+                // Box
+                ctx.strokeStyle = color;
+                ctx.beginPath();
+                ctx.roundRect(x1, y1, width, height, 6);
+                ctx.stroke();
+
+                // Label
+                ctx.fillStyle = color;
+                const text = `${label} ${(score*100).toFixed(0)}%`;
+                const textMetrics = ctx.measureText(text);
+                const textWidth = textMetrics.width;
+                const textHeight = 22;
+
+                ctx.beginPath();
+                ctx.roundRect(x1, y1 - textHeight - 4, textWidth + 12, textHeight, 4);
+                ctx.fill();
+
+                ctx.fillStyle = 'white';
+                ctx.fillText(text, x1 + 6, y1 - 9);
+            });
+        }
+
+        requestAnimationFrame(loop);
+
+    </script>
+</body>
 </html>
