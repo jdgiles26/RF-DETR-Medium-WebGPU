@@ -23,6 +23,22 @@
             </div>
         </div>
         <div id="fps">FPS: 0.0</div>
+        <div id="source-toggle">
+            <button id="source-webcam" class="source-btn active" title="Webcam">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+                Webcam
+            </button>
+            <button id="source-file" class="source-btn" title="Video File">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>
+                File
+            </button>
+            <button id="pause-btn" class="source-btn" title="Pause">
+                <svg id="pause-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                <svg id="play-icon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                <span id="pause-label">Pause</span>
+            </button>
+        </div>
+        <input type="file" id="file-input" accept="video/*" hidden />
         <video id="webcam" autoplay playsinline muted></video>
         <canvas id="overlay"></canvas>
     </div>
@@ -32,6 +48,11 @@
             <span>Threshold</span>
             <input type="range" id="threshold" min="0" max="1" step="0.01" value="0.5">
             <span id="thresh-val">0.50</span>
+        </label>
+        <div class="control-divider"></div>
+        <label class="control-label">
+            <span>Labels (COCO subset)</span>
+            <input type="text" id="allowed-labels" placeholder="e.g. person, car">
         </label>
     </div>
 
@@ -44,160 +65,264 @@
 
         const video = document.getElementById('webcam');
         const overlay = document.getElementById('overlay');
-        const status = document.getElementById('status');
+        const statusOverlay = document.getElementById('status');
         const statusText = document.getElementById('status-text');
         const statusSub = document.getElementById('status-sub');
         const fpsElem = document.getElementById('fps');
         const slider = document.getElementById('threshold');
         const sliderVal = document.getElementById('thresh-val');
+        const btnWebcam = document.getElementById('source-webcam');
+        const btnFile = document.getElementById('source-file');
+        const fileInput = document.getElementById('file-input');
+        const spinner = document.querySelector('.spinner');
+        const allowedLabelsInput = document.getElementById('allowed-labels');
+        const pauseBtn = document.getElementById('pause-btn');
+        const pauseIcon = document.getElementById('pause-icon');
+        const playIcon = document.getElementById('play-icon');
+        const pauseLabel = document.getElementById('pause-label');
 
         let detector;
         let lastTime = performance.now();
         let threshold = 0.5;
-        
+        let allowedLabels = null; // null = no filtering
+        let paused = false;
+        let webcamStream = null;
+
         const inputCanvas = document.createElement('canvas');
         const inputCtx = inputCanvas.getContext('2d', { willReadFrequently: true });
-        
+        const overlayCtx = overlay.getContext('2d');
+
         const COLORS = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899'];
+        const labelColorMap = new Map();
+        let nextColorIndex = 0;
+
+        function getColorForLabel(label) {
+            if (!labelColorMap.has(label)) {
+                labelColorMap.set(label, COLORS[nextColorIndex % COLORS.length]);
+                nextColorIndex++;
+            }
+            return labelColorMap.get(label);
+        }
+        const VIDEO_CONSTRAINTS = { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } };
+
+        // Displayed video rect (accounting for object-fit: contain)
+        let videoRect = { x: 0, y: 0, w: 0, h: 0 };
 
         slider.addEventListener('input', (e) => {
             threshold = parseFloat(e.target.value);
             sliderVal.textContent = threshold.toFixed(2);
         });
-        
-        // Handle high DPI displays
+
+        allowedLabelsInput.addEventListener('input', (e) => {
+            const val = e.target.value.trim();
+            allowedLabels = val ? new Set(val.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)) : null;
+        });
+
+        // Handle high DPI displays and recompute video rect
         function resizeOverlay() {
-            const width = video.clientWidth;
-            const height = video.clientHeight;
+            const cw = video.clientWidth;
+            const ch = video.clientHeight;
             const dpr = window.devicePixelRatio || 1;
-            
-            overlay.width = width * dpr;
-            overlay.height = height * dpr;
-            
-            const ctx = overlay.getContext('2d');
-            ctx.scale(dpr, dpr);
-            
+
+            overlay.width = cw * dpr;
+            overlay.height = ch * dpr;
+            overlayCtx.scale(dpr, dpr);
+
             inputCanvas.width = video.videoWidth;
             inputCanvas.height = video.videoHeight;
+
+            // Compute the visible region of the video within the element
+            const vw = video.videoWidth || cw;
+            const vh = video.videoHeight || ch;
+            const videoAR = vw / vh;
+            const containerAR = cw / ch;
+            const drawW = videoAR > containerAR ? cw : ch * videoAR;
+            const drawH = videoAR > containerAR ? cw / videoAR : ch;
+
+            videoRect = {
+                x: (cw - drawW) / 2,
+                y: (ch - drawH) / 2,
+                w: drawW,
+                h: drawH,
+            };
         }
 
         window.addEventListener('resize', resizeOverlay);
 
-        // 1. Start Camera
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    facingMode: 'environment',
-                    width: { ideal: 640 },
-                    height: { ideal: 480 }
-                },
-                audio: false
-            });
-            
-            video.srcObject = stream;
+        // Wait for the video to be ready, then resize the overlay
+        async function onVideoReady() {
             await new Promise(r => video.onloadedmetadata = r);
             video.play();
             resizeOverlay();
+        }
 
+        function resume() {
+            if (!paused) return;
+            paused = false;
+            pauseIcon.style.display = '';
+            playIcon.style.display = 'none';
+            pauseLabel.textContent = 'Pause';
+            lastTime = performance.now();
+            requestAnimationFrame(loop);
+        }
+
+        // Source switching
+        async function switchToWebcam() {
+            if (video.src) {
+                URL.revokeObjectURL(video.src);
+                video.removeAttribute('src');
+            }
+            video.loop = false;
+
+            try {
+                webcamStream ??= await navigator.mediaDevices.getUserMedia({ video: VIDEO_CONSTRAINTS, audio: false });
+                video.srcObject = webcamStream;
+                await onVideoReady();
+                btnWebcam.classList.add('active');
+                btnFile.classList.remove('active');
+                resume();
+            } catch (e) {
+                console.error('Webcam error:', e);
+            }
+        }
+
+        async function switchToFile(file) {
+            if (webcamStream) {
+                webcamStream.getTracks().forEach(t => t.stop());
+                webcamStream = null;
+            }
+            video.srcObject = null;
+            video.src = URL.createObjectURL(file);
+            video.loop = true;
+            video.muted = true;
+            await onVideoReady();
+            btnFile.classList.add('active');
+            btnWebcam.classList.remove('active');
+            resume();
+        }
+
+        btnWebcam.addEventListener('click', switchToWebcam);
+        btnFile.addEventListener('click', () => fileInput.click());
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) switchToFile(file);
+            fileInput.value = ''; // reset so same file can be re-selected
+        });
+
+        pauseBtn.addEventListener('click', () => {
+            if (paused) {
+                resume();
+                video.play();
+            } else {
+                paused = true;
+                pauseIcon.style.display = 'none';
+                playIcon.style.display = '';
+                pauseLabel.textContent = 'Play';
+                video.pause();
+            }
+        });
+
+        function showError(title, message) {
+            statusText.textContent = title;
+            statusSub.textContent = message;
+            spinner.style.display = 'none';
+        }
+
+        // 1. Start Camera
+        try {
+            await switchToWebcam();
         } catch (e) {
-            statusText.textContent = "Camera Error";
-            statusSub.textContent = e.message;
-            document.querySelector('.spinner').style.display = 'none';
+            showError("Camera Error", e.message);
             throw e;
         }
 
         // 2. Load Model
         statusText.textContent = "Loading Model...";
-        statusSub.textContent = "Downloading RF-DETR Nano (fp32)";
-        
+        statusSub.textContent = "Downloading RF-DETR Medium (fp32)";
+
         try {
-            detector = await pipeline('object-detection', 'onnx-community/rfdetr_nano-ONNX', {
+            detector = await pipeline('object-detection', 'onnx-community/rfdetr_medium-ONNX', {
                 device: 'webgpu',
                 dtype: 'fp32',
             });
-            
+
             // 3. Warmup
             statusText.textContent = "Compiling Shaders...";
             statusSub.textContent = "This may take a moment";
-            
+
             inputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
             await detector(inputCanvas, { threshold: 0.5, percentage: true });
 
-            status.style.opacity = '0';
-            setTimeout(() => status.style.display = 'none', 300);
-
+            statusOverlay.style.opacity = '0';
+            setTimeout(() => statusOverlay.style.display = 'none', 300);
         } catch (e) {
-            statusText.textContent = "Model Error";
-            statusSub.textContent = e.message;
-            document.querySelector('.spinner').style.display = 'none';
+            showError("Model Error", e.message);
             throw e;
         }
 
         // 4. Render Loop
         async function loop() {
+            if (paused) return;
+
             const now = performance.now();
             const dt = now - lastTime;
             lastTime = now;
-            
+
             if (dt > 0) {
                 fpsElem.textContent = `FPS: ${(1000 / dt).toFixed(1)}`;
             }
 
             inputCtx.drawImage(video, 0, 0, inputCanvas.width, inputCanvas.height);
 
-            const results = await detector(inputCanvas, {
-                threshold: threshold,
-                percentage: true
-            });
+            let results = await detector(inputCanvas, { threshold, percentage: true });
+            if (allowedLabels) {
+                results = results.filter(r => allowedLabels.has(r.label.toLowerCase()));
+            }
             drawResults(results);
 
             requestAnimationFrame(loop);
         }
 
         function drawResults(results) {
-            const ctx = overlay.getContext('2d');
-            const w = video.clientWidth;
-            const h = video.clientHeight;
-            
-            // Clear canvas
-            ctx.save();
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
-            ctx.clearRect(0, 0, overlay.width, overlay.height);
-            ctx.restore();
+            const { x: vx, y: vy, w, h } = videoRect;
 
-            // Set styles common to all results
-            ctx.font = '600 13px system-ui';
-            ctx.lineWidth = 2.5;
+            // Clear canvas (reset transform to clear full physical size, then restore DPR scale)
+            overlayCtx.setTransform(1, 0, 0, 1, 0, 0);
+            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+            const dpr = window.devicePixelRatio || 1;
+            overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-            results.forEach((res, i) => {
-                const { box, label, score } = res;
-                const color = COLORS[i % COLORS.length];
+            overlayCtx.font = '600 13px system-ui';
+            overlayCtx.lineWidth = 2.5;
 
-                const x1 = box.xmin * w;
-                const y1 = box.ymin * h;
-                const width = (box.xmax - box.xmin) * w;
-                const height = (box.ymax - box.ymin) * h;
+            for (let i = 0; i < results.length; ++i) {
+                const { box, label, score } = results[i];
+                const color = getColorForLabel(label);
 
-                // Box
-                ctx.strokeStyle = color;
-                ctx.beginPath();
-                ctx.roundRect(x1, y1, width, height, 6);
-                ctx.stroke();
+                const x1 = vx + box.xmin * w;
+                const y1 = vy + box.ymin * h;
+                const bw = (box.xmax - box.xmin) * w;
+                const bh = (box.ymax - box.ymin) * h;
 
-                // Label
-                ctx.fillStyle = color;
-                const text = `${label} ${(score*100).toFixed(0)}%`;
-                const textMetrics = ctx.measureText(text);
-                const textWidth = textMetrics.width;
-                const textHeight = 22;
+                // Bounding box
+                overlayCtx.strokeStyle = color;
+                overlayCtx.beginPath();
+                overlayCtx.roundRect(x1, y1, bw, bh, 6);
+                overlayCtx.stroke();
 
-                ctx.beginPath();
-                ctx.roundRect(x1, y1 - textHeight - 4, textWidth + 12, textHeight, 4);
-                ctx.fill();
+                // Label background
+                const text = `${label} ${(score * 100).toFixed(0)}%`;
+                const textWidth = overlayCtx.measureText(text).width;
 
-                ctx.fillStyle = 'white';
-                ctx.fillText(text, x1 + 6, y1 - 9);
-            });
+                overlayCtx.fillStyle = color;
+                overlayCtx.beginPath();
+                overlayCtx.roundRect(x1, y1 - 26, textWidth + 12, 22, 4);
+                overlayCtx.fill();
+
+                // Label text
+                overlayCtx.fillStyle = 'white';
+                overlayCtx.fillText(text, x1 + 6, y1 - 9);
+            }
         }
 
         requestAnimationFrame(loop);
