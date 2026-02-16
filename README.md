@@ -1,5 +1,5 @@
 ---
-title: RF DETR WebGPU
+title: RF DETR Nano WebGPU
 emoji: ⚡
 colorFrom: green
 colorTo: pink
